@@ -105,7 +105,7 @@ Then, we can configure the infrastructure services from the `Startup` class like
 {% highlight csharp %}
 public void ConfigureServices(IServiceCollection services)
 {
-	services.AddInfrastructureServices(
+    services.AddInfrastructureServices(
         Configuration.GetConnectionString("DefaultConnection"));
 }
 {% endhighlight %}
