@@ -2,7 +2,7 @@
 layout: post
 title:  "ASP.NET Startup class organization"
 date:   2020-05-17 23:32:06 +0200
-categories: ASP.NET IServiceCollection
+categories: ASP.NET
 ---
 Each ASP.NET `Startup` class contains two methods that are called by the host when the app starts:
 * a `Configure` method to create the app's request processing pipeline using `UseXxx` extension methods
@@ -60,12 +60,14 @@ Once this is done, the refactored `Startup` class looks much cleaner:
 
 {% highlight csharp %}
 public class Startup {  
-	public void ConfigureServices(IServiceCollection services) {  
-		services.AddXxxConfig()  
-	}  
-	public void Configure(IApplicationBuilder app, IHostingEnvironment env, ILoggerFactory loggerFactory) {  
-		app.UseXxxConfig()  
-	}  
+    public void ConfigureServices(IServiceCollection services)
+    {
+        services.AddXxxConfig()  
+    }  
+    public void Configure(IApplicationBuilder app)
+    {
+        app.UseXxxConfig()  
+    }
 }
 {% endhighlight %}
 
@@ -84,14 +86,17 @@ Since the `Startup` class is typically a part of the Web/API project, this break
 {% highlight csharp %}
 namespace MyProject.Infrastructure
 {
-	public static class InfrastructureConfigurationExtension
-	{
-		public static void AddInfrastructureServices(this IServiceCollection services, string connStringDB)
-		{
-      // Set up EF or any other data store
-			services.AddDbContext<XxxDbContext>(options => options.UseSqlServer(connStringDB));
-		}
-	}
+    public static class InfrastructureConfigurationExtension
+    {
+        public static void AddInfrastructureServices(
+            this IServiceCollection services, 
+            string connStringDB)
+        {
+            // Set up EF or any other data store
+            services.AddDbContext<XxxDbContext>(options => 
+                options.UseSqlServer(connStringDB));
+        }
+    }
 }
 {% endhighlight %}
 
@@ -100,7 +105,8 @@ Then, we can configure the infrastructure services from the `Startup` class like
 {% highlight csharp %}
 public void ConfigureServices(IServiceCollection services)
 {
-	services.AddInfrastructureServices(Configuration.GetConnectionString("DefaultConnection"));
+	services.AddInfrastructureServices(
+        Configuration.GetConnectionString("DefaultConnection"));
 }
 {% endhighlight %}
 
