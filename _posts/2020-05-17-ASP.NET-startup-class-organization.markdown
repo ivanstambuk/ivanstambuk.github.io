@@ -1,0 +1,109 @@
+---
+layout: post
+title:  "ASP.NET Startup class organization"
+date:   2020-05-17 23:32:06 +0200
+categories: ASP.NET IServiceCollection
+---
+Each ASP.NET `Startup` class contains two methods that are called by the host when the app starts:
+* a `Configure` method to create the app's request processing pipeline using `UseXxx` extension methods
+* an optional `ConfigureServices` method to register and configure the app's services using `AddXxx` extension methods
+
+They are typically used like so:
+
+{% highlight csharp %}
+public class Startup
+{
+    // Add host-provided injectable services in the constructor as necessary
+    public Startup() {}
+
+    public void ConfigureServices(IServiceCollection services)
+    {
+        // Set up services
+        services.AddXxx();
+    }
+
+    public void Configure(IApplicationBuilder app)
+    {
+        // Add middleware components
+        app.UseXxx();
+    }
+}
+{% endhighlight %}
+
+# Large configurations
+Larger projects usually have dozens of services and middleware components set up in these two methods, often with very large configuration objects, complex in-line middleware logic and configuration-dependent execution paths. This leads to hundreds of lines of scrollable code in each of the `Startup`'s method, which is not only painful to navigate and maintain, but can also lead to subtle bugs, since e.g. a wrong order of middleware components added in the `Configure` method can lead to faulty behavior at runtime.
+
+C# extension methods can help us tackle this issue by extending the `IServiceCollection` and `IApplicationBuilder` types. For each service or middleware `Xxx` configuration that we want to extract out of the `Startup` class we thus create a separate `static` class `XxxConfigurationExtension` that contains extension methods for either or both of those types. These new types are best kept in a separate directory, such as `ConfigurationExtensions` or `StartupExtensions`.
+
+{% highlight csharp %}
+namespace MyProject.API
+{
+    public static class XxxConfigurationExtension
+    {
+        public static void AddXxxConfig(this IServiceCollection services)
+        {
+           // Perform a complex set-up of Xxx
+           services.AddXxx();
+        }
+
+        public static void UseXxxConfig(this IApplicationBuilder app)
+        {
+            // Perform a complex set-up of Xxx
+            app.UseXxx();
+        }
+    }
+}
+{% endhighlight %}
+
+If the `AddXxxConfig` or `UseXxxConfig` methods require access to the injectable services of `Configure` or `ConfigureServices`, these services can be passed as direct arguments when invoking them.
+Once this is done, the refactored `Startup` class looks much cleaner:
+
+{% highlight csharp %}
+public class Startup {  
+	public void ConfigureServices(IServiceCollection services) {  
+		services.AddXxxConfig()  
+	}  
+	public void Configure(IApplicationBuilder app, IHostingEnvironment env, ILoggerFactory loggerFactory) {  
+		app.UseXxxConfig()  
+	}  
+}
+{% endhighlight %}
+
+# Separation of concerns
+One extra benefit provided by these extension methods is the ability to extract pieces of code that shouldn't really even be there in the first place. For example, the usage of Entity Framework (EF) requires a registration of the `DbContext`-derived types in the service container.
+
+{% highlight csharp %}
+public void ConfigureServices(IServiceCollection services)
+{
+    services.AddDbContext<XxxContext>(options => options.UseXxx()));
+}
+{% endhighlight %}
+
+Since the `Startup` class is typically a part of the Web/API project, this breaks the dependency inversion principle by requiring an explicit dependency on the data store used by the data access/infrastructure layer project, i.e. the `Microsoft.EntityFrameworkCore` assembly in case of EF. This can also easily be fixed by creating an extension method in the infrastructure project itself that adds the necessary contexts into the service container.
+
+{% highlight csharp %}
+namespace MyProject.Infrastructure
+{
+	public static class InfrastructureConfigurationExtension
+	{
+		public static void AddInfrastructureServices(this IServiceCollection services, string connStringDB)
+		{
+      // Set up EF or any other data store
+			services.AddDbContext<XxxDbContext>(options => options.UseSqlServer(connStringDB));
+		}
+	}
+}
+{% endhighlight %}
+
+Then, we can configure the infrastructure services from the `Startup` class like so:
+
+{% highlight csharp %}
+public void ConfigureServices(IServiceCollection services)
+{
+	services.AddInfrastructureServices(Configuration.GetConnectionString("DefaultConnection"));
+}
+{% endhighlight %}
+
+As a rule of thumb, all of our services that are implemented in a separate project in the solution should have a similar `IServiceCollection` extension methods that configure and register them in the service container. 
+
+Note also that the frequently-used EF CLI tool `ef` requires the `Microsoft.EntityFrameworkCore.Design` package to run, and that it also expect to find a `CreateHostBuilder` method that configures the host without running the app in the project specified as `--startup-project`. Since `CreateHostBuilder` is only found the API/Web project that contains the `Program` class, the dependency on EF cannot be removed entirely in that typical scenario.
