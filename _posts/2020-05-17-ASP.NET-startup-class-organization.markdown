@@ -88,13 +88,10 @@ namespace MyProject.Infrastructure
 {
     public static class InfrastructureConfigurationExtension
     {
-        public static void AddInfrastructureServices(
-            this IServiceCollection services, 
-            string connStringDB)
+        public static void AddInfrastructureServices(this IServiceCollection services, string connStringDB)
         {
             // Set up EF or any other data store
-            services.AddDbContext<XxxDbContext>(options => 
-                options.UseSqlServer(connStringDB));
+            services.AddDbContext<XxxDbContext>(options => options.UseSqlServer(connStringDB));
         }
     }
 }
@@ -105,11 +102,10 @@ Then, we can configure the infrastructure services from the `Startup` class like
 {% highlight csharp %}
 public void ConfigureServices(IServiceCollection services)
 {
-    services.AddInfrastructureServices(
-        Configuration.GetConnectionString("DefaultConnection"));
+    services.AddInfrastructureServices(Configuration.GetConnectionString("DefaultConnection"));
 }
 {% endhighlight %}
 
 As a rule of thumb, all of our services that are implemented in a separate project in the solution should have a similar `IServiceCollection` extension methods that configure and register them in the service container. 
 
-Note also that the frequently-used EF CLI tool `ef` requires the `Microsoft.EntityFrameworkCore.Design` package to run, and that it also expect to find a `CreateHostBuilder` method that configures the host without running the app in the project specified as `--startup-project`. Since `CreateHostBuilder` is only found the API/Web project that contains the `Program` class, the dependency on EF cannot be removed entirely in that typical scenario.
+Note also that the frequently-used EF CLI tool `ef` requires the `Microsoft.EntityFrameworkCore.Design` package to run, and that it also expects to find a `CreateHostBuilder` method that configures the host without running the app in the project specified as `--startup-project`. Since `CreateHostBuilder` is only found in the API/Web project that contains the `Program` class, the dependency on EF cannot be removed entirely in that typical scenario.
