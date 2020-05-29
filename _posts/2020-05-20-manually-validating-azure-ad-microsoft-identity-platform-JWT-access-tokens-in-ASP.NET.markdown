@@ -76,11 +76,11 @@ services.AddAuthentication(options =>
     });
 {% endhighlight %}
 
-The biggest issue with our validator is that it is instantiated only once, making it effectively a singleton, so we can’t have dependencies on transient and scoped services. To fix this we have to either manully force a new scope from `IServiceProvider` for each token validator call, or register a custom implementation of `IPostConfigureOptions<JwtBearerOptions>` which will wire up the `MyTokenValidator` when instantiated by the service cointainer, and which call also pass any necessary dependencies.
+The biggest issue with our validator is that it is instantiated only once, making it effectively a singleton, so we can’t have dependencies on transient and scoped services. To fix this we have to either manually force a new scope from `IServiceProvider` for each token validator call, or register a custom implementation of `IPostConfigureOptions<JwtBearerOptions>` which will wire up the `MyTokenValidator` when instantiated by the service container, and which call also pass any necessary dependencies.
 
 To access the `HttpContext` we would need to register the `IHttpContextAccessor` service in the service container, and use one of the DI workarounds to pass it to the handler where we can obtain the value of the `IHttpContextAccessor.HttpContext` property.
 
-Additionally, bypassing the authenticaion altogether in case of an e.g. unprotected endpoint requires overriding the `OnChallenge` event of the `JwtBearerEvents` class, with a custom logic that also has to be specified when registering the authentication middleware:
+Additionally, bypassing the authentication altogether in case of an e.g. unprotected endpoint requires overriding the `OnChallenge` event of the `JwtBearerEvents` class, with a custom logic that also has to be specified when registering the authentication middleware:
 
 {% highlight csharp %}
     options.Events = new JwtBearerEvents()
@@ -125,7 +125,7 @@ public class MyAuthenticationMiddleware
 
     public async Task InvokeAsync(
         HttpContext context,
-        // Add can add any other injectable service like ILogger
+        // You can add any other injectable service like ILogger
         ILogger<MyAuthenticationMiddleware> logger
         )
     { }
@@ -145,7 +145,7 @@ if (authHeader == null)
 }
 {% endhighlight %}
 
-If the required header is present, the next step should be an inspection of whether the header is in the proper format, i.e having an appropriate prefix such as `Bearer` or `APIKEY`. The appropriate JWT/API key should be extracted and eventually, after a successfull validation, mapped to set of options that identify the user and provide an authoriazion context, to be used later in the request pipeline.
+If the required header is present, the next step should be an inspection of whether the header is in the proper format, i.e. having an appropriate prefix such as `Bearer` or `APIKEY`. The appropriate JWT/API key should be extracted and eventually, after a successful validation, mapped to set of options that identify the user and provide an authorization context, to be used later in the request pipeline.
 
 JWT token should be parsed manually and analyzed before invoking the validator. For example, In case of multiple issuers/audiences, it is advisable to do a manual check whether the issued JWT conforms to the required issuer origin policy. For example, if we have separate AD directories for development and production, tokens issued for the development environment should fail validation if used on the production environment, and vice versa. Sometimes however hosts are only available in production environments, and in such cases audiences should be valid in both environment. Such policies can be hard-coded because they are not changed frequently. An example implementation would be as follows:
 
@@ -174,7 +174,7 @@ var tfp = token.Payload["tfp"].ToString(); // Sign-in policy name
 var metadataEndpoint = $"{iss}.well-known/openid-configuration?p={tfp}";
 {% endhighlight %}
 
-This metadata endpoint is then fed into the `ConfigurationManager`. A very important thing to keep in mind is to make sure that the `ConfigurationManager` initialization is done only once, either by making the instance a singleton, or by caching the instances into a static `Dictionary<string, ConfigurationManager<OpenIdConnectConfiguration>>` field, with the metadata endpoint used as a key. This is due to the fact that processing the metadata endpoint incurs a non-trivial time cost, and by caching the instance we can reuse it for validation in the subsequent requests, saving dozens of milliseconds.
+This metadata endpoint is then fed into the `ConfigurationManager`. A very important thing to keep in mind is to make sure that the `ConfigurationManager` initialization is done only once, either by making the instance a singleton, or by caching the instances into a static `Dictionary<string, ConfigurationManager<OpenIdConnectConfiguration>>` field, with the metadata endpoint used as a key. This is due to the fact that processing the metadata endpoint incurs a non-trivial time cost, and by caching the instance we can reuse it for validation in subsequent requests, saving dozens of milliseconds.
 
 {% highlight csharp %}
 var cm = new ConfigurationManager<OpenIdConnectConfiguration>(metadataEndpoint,
@@ -228,9 +228,9 @@ catch (Exception e)
 
 If the validation is successful, we can store the acquired `ClaimsPrincipal` object into the `HttpContext.User` property to make use of it in the authorization handler later. Additionally, other checks can be performed on the user identity against external configuration sources or data stores, such as whether the user account has been disabled since the token was issued, or at all if that kind of information wasn't available during the login. Such catch-all deny policies are best kept directly in the authentication layer to make sure that no user context or options initialization occurs at all.
 
-Usually the JWT token contains a lot more than it is required to establish the user identity; the stuff like user ID, assigned roles and whatever else is necessary to authorize access to resources. In fact, the official JWT site explicitly mentions "authorization" (in contrast to "authentication") as a usecase for JWT, assuming that the token claims have been issued against a data store containing all the necessary information to create an authorization context, which is often not the case. This kind of usage makes it impossible to alter those types of policies for a specific user after the token has been issued. The usual fix for rejecting invalidated tokes involves a data store call to verify blacklisted token, which defeats the purpose of using JWT for authorization in the first place. Lastly, it's inconvenient to force a user to relogin/refresh their token each time their access rights have been changed.
+Usually the JWT token contains a lot more than it is required to establish the user identity; the stuff like user ID, assigned roles and whatever else is necessary to authorize access to resources. In fact, the official JWT site explicitly mentions "authorization" (in contrast to "authentication") as a use case for JWT, assuming that the token claims have been issued against a data store containing all the necessary information to create an authorization context, which is often not the case. This kind of usage makes it impossible to alter those types of policies for a specific user after the token has been issued. The usual fix for rejecting invalidated tokes involves a data store call to verify blacklisted tokens, which defeats the purpose of using JWT for authorization in the first place. Lastly, it's inconvenient to force a user to relogin/refresh their token each time their access rights have been changed.
 
-That being said, JWT token should be used exclusively for authentication. Once the identity is established the authentication middleware should fill in all the options necessary to provide an authorization context for server resources in subsequent layers. Some of these options could be extracted from the JWT token payload, some from the data store or any other external sources. Since the `InvokeAsync` has a painless access to the service container, let's first define a set of options we're interested in:
+That being said, JWT token should be used exclusively for authentication. Once the identity is established the authentication middleware should fill in all the options necessary to provide an authorization context for server resources in lower layers. Some of these options could be extracted from the JWT token payload, some from the data store or any other external sources. Since the `InvokeAsync` has a painless access to the service container, let's first define a set of options we're interested in:
 
 {% highlight csharp %}
 public class SecurityOptions
@@ -239,7 +239,7 @@ public class SecurityOptions
     public bool IsAuthenticated { get; set; }
     public string AccountName { get; set; }
     public AccountRole Role { get; set; }
-    // Fill in the fields necessary to grant access or provide an execution context for the request
+    // Fill in the fields necessary to grant access or provide an execution context for requests
 }
 {% endhighlight %}
 
@@ -250,9 +250,9 @@ public async Task InvokeAsync(
     HttpContext context,
     IOptionsSnapshot<SecurityOptions> options)
 {
-    // after a successful validation, fill in the security options
+    // After a successful validation, fill in the security options
     options.Value.IsAuthenticated = true;
-    options.Value.Role = getRolesForUser(accountName);
+    options.Value.Role = getRoleForUser(accountName);
     // ...
 }
 {% endhighlight %}
