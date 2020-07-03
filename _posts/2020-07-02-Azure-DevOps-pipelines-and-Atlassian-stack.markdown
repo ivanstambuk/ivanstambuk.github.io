@@ -9,9 +9,9 @@ As it turns out, using Atlassian Bitbucket as an imported repository for CI/CD u
 
 In a similar vein, Atlassian JIRA plugin for Azure DevOps pipelines, reportedly developed in a joint effort with Microsoft, doesn't work more than it does - just a cursory look at [a string of one-star reviews](https://marketplace.atlassian.com/apps/1220515/azure-pipelines-for-jira?hosting=cloud&tab=reviews) is enough to get the full picture of its abysmal state. Installing it alone requires hacking around with browser DOM to make the hidden `iframe` visible in order to complete the installation.
 
-So if your stack is Atlassian JIRA for ALM, Bitbucket for code storage, and Azure DevOps pipelines for CI/CD, you are in a rough spot. If you were thinking of hydrating the variables during the pipeline execution, by using an external service that will transform commit ID into a set of desired credentials - it won't work, because [predefined variables are read only](https://docs.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml).
+So if your stack is Atlassian JIRA for ALM, Bitbucket for code storage, and Azure DevOps pipelines for CI/CD, you are in a rough spot. If you were thinking of hydrating the variables during the pipeline execution, by using an external service or perhaps the `git log -1 --pretty=format` command that will transform the current commit ID into a set of desired credentials necessary for the notification system to work - it's no good, because [predefined variables are read only](https://docs.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml).
 
-Fortunately, there is a elegant solution to the rescue - git remotes. We will create a mirror of the Bitbucket repository on the Azure Repos, and will manually push all changes to both remotes, which will eliminate the `Build.RequestedXxx` bug.
+Fortunately, there is an elegant solution to the rescue - git remotes. We will create a mirror of the Bitbucket repository on Azure Repos, and we will manually push all changes to both remotes, which will eliminate the `Build.RequestedXxx` bug.
 
 # Multiple git remotes
 
@@ -48,3 +48,5 @@ git push -u all
 {% endhighlight %}
 
 Now, the `git remote -v` command in the terminal should list two push URLs for the default remote `all`. The `origin` remote should not be explicitly named in any git commands from now on.
+
+If the company's DevOps security policy forbids developers access to the Azure DevOps boards so that they can't be added as users to Azure DevOps projects and set notifications on their own, then we must do it for them. In fact, the entire process could be automated and the above script could be run on an external service which will be triggered on a push or PR operation, and will propagate repository changes to the Azure DevOps repo in the background that only it knows about. Azure CLI for DevOps [currently doesn' support notification system](https://docs.microsoft.com/en-us/cli/azure/ext/azure-devops/devops?view=azure-cli-latest), but [the REST API does](https://docs.microsoft.com/en-us/rest/api/azure/devops/notification/?view=azure-devops-rest-5.1), and that service could programatically create notifications on a per-project basis for everyone involved in the commit/PR before mirroring the repository changes, and delete them afterwards. This is a nice idea for a side project.
