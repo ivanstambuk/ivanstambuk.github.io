@@ -23,7 +23,7 @@ title: Ivan Štambuk
 description: >- # this means to ignore newlines until "baseurl:"
   Ivan Štambuk's Github pages
 baseurl: "" # the subpath of your site, e.g. /blog
-url: "" # the base hostname & protocol for your site, e.g. http://example.com
+url: "https://ivanstambuk.github.io" # the base hostname & protocol for your site, e.g. http://example.com
 # twitter_username: jekyllrb
 github_username: ivanstambuk
 
@@ -31,6 +31,7 @@ github_username: ivanstambuk
 theme: minima
 plugins:
   - jekyll-feed
+  - jekyll-sitemap
 
 # Exclude from processing.
 # The following items will not be processed, by default.
