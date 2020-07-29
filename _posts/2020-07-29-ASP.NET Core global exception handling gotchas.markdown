@@ -4,6 +4,7 @@ title:  "ASP.NET Core global exception handling gotchas"
 date:   2020-07-29 00:02:06 +0200
 categories: ASP.NET
 ---
+
 Implementing an ASP.NET global exception handler is usually done for purposes such as:
 1. Translating exception types into HTTP status codes, possibly with accompanying customized user-friendly messages (i18n/l10n)
 2. Logging aberrant behavior (domain errors that represent inconsistent state, unhandled exceptions)
