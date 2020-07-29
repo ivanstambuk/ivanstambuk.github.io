@@ -1,0 +1,483 @@
+---
+layout: post
+title:  "ASP.NET Core global exception handling gotchas"
+date:   2020-07-29 00:02:06 +0200
+categories: ASP.NET
+---
+Implementing an ASP.NET global exception handler is usually done for purposes such as:
+1. Translating exception types into HTTP status codes, possibly with accompanying customized user-friendly messages (i18n/l10n)
+2. Logging aberrant behavior (domain errors that represent inconsistent state, unhandled exceptions)
+3. Notifying engineers in case critical conditions manifest themselves (e-mail, ChatOps etc.)
+4. Triggering background jobs in case of specific errors (e.g. refresh SQL indices in case of an SQL timeout exception)
+
+There are several way how to do implement them, so let's first investigate the available methods before we discuss corner cases and gotchas.
+
+# Exception middleware
+Writing a middleware enables us to inject dependant services into `Invoke`, and provides a direct access to the underlying `HttpContext`. We just invoke the next delegate in the middleware stack, assuming that we are the first one to execute, and handle the exception if it occurs:
+
+{% highlight csharp %}
+public class ErrorHandlingMiddleware
+{
+    private readonly RequestDelegate _next;
+
+    public ErrorHandlingMiddleware(RequestDelegate next)
+    {
+        _next = next;
+    }
+
+    public async Task Invoke(HttpContext context, IWebHostEnvironment env)
+    {
+        try
+        {
+            await _next(context);
+        }
+        catch (Exception ex)
+        {
+            await HandleExceptionAsync(context, ex, env);
+        }
+    }
+
+    private static Task HandleExceptionAsync(
+        HttpContext context, 
+        Exception exception, 
+        IWebHostEnvironment env)
+    {
+        // custom logic goes here, we can write to context.Response and its properties
+    }
+}
+{% endhighlight %}
+The `try-catch` block can be extended to catch more specific exceptions first (including your domain exceptions). You can see the default ASP.NET implementation of the exception middleware `ExceptionHandlerMiddleware` [here](https://github.com/dotnet/aspnetcore/blob/master/src/Middleware/Diagnostics/src/ExceptionHandler/ExceptionHandlerMiddleware.cs). This implementation already contains fixes for some edge cases which we will cover later, and which we need to replicate if we want to build our own exception handling middleware.
+
+# Exception handler lambda
+[Microsoft-supplied example](https://docs.microsoft.com/en-us/aspnet/core/fundamentals/error-handling?view=aspnetcore-3.1#exception-handler-lambda) uses a more concise version of the previous method, by using the `UseExceptionHandler` extension method which enables us to construct a terminal middleware by using a `Run` method.
+
+{% highlight csharp %}
+app.UseExceptionHandler(errorApp =>
+{
+    errorApp.Run(async context =>
+    {
+        // custom logic
+        await context.Response.WriteAsync(new string(' ', 512)); // IE padding
+    });
+});
+{% endhighlight %}
+
+And there we already have our first gotcha - the [IE padding issue](https://github.com/dotnet/AspNetCore.Docs/issues/16144), in case you have to care about IE at all, that is.
+
+Under the hood, it's [just a wrapper for the default implementation](https://github.com/dotnet/aspnetcore/blob/master/src/Middleware/Diagnostics/src/ExceptionHandler/ExceptionHandlerExtensions.cs) mentioned previously. This is _the_ recommended way by MS to implement global exception handlers.
+
+# ExceptionHandlerOptions
+This is a variant of the previous method. The `ExceptionHandlerMiddleware` takes an `ExceptionHandlerOptions` as a parameter, which has two properties:
+
+{% highlight csharp %}
+public class ExceptionHandlerOptions
+{
+    public PathString ExceptionHandlingPath { get; set; }
+    public RequestDelegate ExceptionHandler { get; set; }
+}
+{% endhighlight %}
+
+The second one is of interest (for the first one, see below) because it enables us to pass execution to our own middleware in a separate function, and we don't need to use lambda. It can be used in `Configure` either directly:
+
+{% highlight csharp %}
+app.UseExceptionHandler(new ExceptionHandlerOptions
+{
+    ExceptionHandler = ... // provide implementation
+});
+{% endhighlight %}
+
+which we don't want, or by passing our custom extension method:
+
+{% highlight csharp %}
+app.UseExceptionHandler(err => err.UseCustomExceptions());
+
+// ...
+
+public static void UseCustomExceptions(this IApplicationBuilder app)
+{
+    app.Use(HandleExceptionResponse);
+}
+
+private static Task HandleExceptionResponse(HttpContext httpContext, Func<Task> next)
+{
+    // Exception handler middleware has everything already set up for us
+    var exceptionDetails = httpContext.Features.Get<IExceptionHandlerFeature>();
+    var ex = exceptionDetails?.Error;
+    // add custom logic here
+}
+{% endhighlight %}
+
+# Community.AspNetCore.ExceptionHandling.Mvc
+This is a [NuGet package](https://www.nuget.org/packages/Community.AspNetCore.ExceptionHandling.Mvc) written by Ihar Yakimush which allows to set a chain of exception handlers per exception type. Each exception type can have a policy registered, and a number of handlers that are executed in order. It comes with a bunch of built-in handlers, such as logging (`Log`), retry (`Retry`), for setting response headers and body (`Response`) and others. It can be registered in `ConfigureServices` like so:
+
+{% highlight csharp %}
+services.AddExceptionHandlingPolicies(options =>
+{
+    options.For<InitializationException>().Rethrow();
+
+    options.For<SomeTransientException>().Retry(ro => ro.MaxRetryCount = 2).NextPolicy();
+
+    options.For<SomeBadRequestException>()
+    .Response(e => 400)
+        .Headers((h, e) => h["X-MyCustomHeader"] = e.Message)
+        .WithBody((req,sw, exception) =>
+            {
+                byte[] array = Encoding.UTF8.GetBytes(exception.ToString());
+                return sw.WriteAsync(array, 0, array.Length);
+            })
+    .NextPolicy();
+
+    // Ensure that all exception types are handled by adding handler for generic exception at the end.
+    options.For<Exception>()
+    .Log(lo =>
+        {
+            lo.EventIdFactory = (c, e) => new EventId(123, "UnhandledException");
+            lo.Category = (context, exception) => "MyCategory";
+        })
+    .Response(null, ResponseAlreadyStartedBehaviour.GoToNextHandler)
+        .ClearCacheHeaders()
+        .WithObjectResult((r, e) => new { msg = e.Message, path = r.Path })
+    // To prevent re throw of exception handlers chain MUST ends with "Handled" transition.
+    .Handled();
+});
+{% endhighlight %}
+
+# ExceptionFilterAttribute, IExceptionFilter
+This is an abstract filter that runs asynchronously after an action has thrown an `Exception`. It can be useful as a means of providing different exception handlers for Web APIs and MVC/Razor Pages exceptions. By implementing a custom `ExceptionFilterAttribute` we can access the `ActionContext` since the `ExceptionContext` implements it via the `FilterContext`. This allows us to see what controller implementation that caused the exception. This is done by checking if the controller implements `ControllerBase` (implemented by both APIs and Razor Pages) and or `Controller` (not implemented by APIs).
+
+{% highlight csharp %}
+// alternatively, derive from IExceptionFilter
+public class HttpGlobalExceptionFilter : ExceptionFilterAttribute
+{
+    public HttpGlobalExceptionFilter(
+        // add injectable services as arguments and store them locally
+        )
+    { }
+
+    // Subclasses must override OnException or OnExceptionAsync, but not both.
+    public override void OnException(ExceptionContext context)
+    {
+        var actionDescriptor = (Controllers.ControllerActionDescriptor)context.ActionDescriptor;
+        var controllerType = actionDescriptor.ControllerTypeInfo.AsType();
+
+        var controllerBase = typeof(ControllerBase);
+        var controller = typeof(Controller);
+
+        var isAPIException = controllerType.IsSubclassOf(controllerBase) 
+                                && !controllerType.IsSubclassOf(controller);
+        var isPagesException = controllerType.IsSubclassOf(controllerBase) 
+                                && controllerType.IsSubclassOf(controller);
+        // add custom logic based on exception type and action method
+        // HTTP context is accessible via context.HttpContext, and exception via context.Exception
+
+        base.OnException(context);
+    }
+}
+
+{% endhighlight %}
+
+It can be registered in `ConfigureServices` like so:
+{% highlight csharp %}
+services.AddMvc(options =>
+{
+  options.Filters.Add(typeof(HttpGlobalExceptionFilter));
+})
+{% endhighlight %}
+
+`IExceptionFilter` is simply the base interface that `ExceptionFilterAttribute` derives from. There is also an `async` version, `IAsyncExceptionFilter`, which requires an implementation of the `OnExceptionAsync` method instead.
+
+MS in general discourages usage of the exception filter in favor of the exception middleware that was mentioned previously. Sending back different results based on which action method is called, such as JSON for API and HTML/error page for a Razor Page, is one notable usage case for the exception filter. An overview of pros and cons of exception filters is covered in [MS docs](https://docs.microsoft.com/en-us/aspnet/core/mvc/controllers/filters?view=aspnetcore-3.1#exception-filters).
+
+# Exception handler endpoint
+Another method that takes advantage of the built-in exception handling middleware is specifying the exception handler API route in `UseExceptionHandler`, which corresponds to the `ExceptionHandlingPath` property of the `ExceptionHandlerOptions` class. This method is useful for both API and Razor Pages handlers.
+
+{% highlight csharp %}
+app.UseExceptionHandler("/error");
+{% endhighlight %}
+
+Then, we just bind our API to that route and process the exception:
+
+{% highlight csharp %}
+[ApiController]
+public class ErrorController : ControllerBase
+{
+    [Route("/error")]
+    public IActionResult Error()
+    {
+        // Gets the status code from the exception or web server.
+        var statusCode = 
+            HttpContext.Features.Get<IExceptionHandlerFeature>()?.Error is HttpException httpEx ?
+            httpEx.StatusCode : (HttpStatusCode)Response.StatusCode;
+
+        // Get the HTTP context and exception type
+        var context = HttpContext.Features.Get<IExceptionHandlerFeature>();
+        var exceptionType = context.Error.GetType();
+
+        // Assuming all APIs have /api/ prefix. Use your own logic if necessary.
+        var isAPIException = HttpContext.Features.Get<IHttpRequestFeature>()
+                                .RawTarget.StartsWith("/api/", StringComparison.Ordinal);
+        if (isAPIException)
+        {
+            // add custom logic. send back status code, ProblemDetails or whatever, but not a view/page
+            return StatusCode((int)statusCode);
+        }
+
+        // For Razor Pages, create a view model for a user-friendly error page.
+        string text = null;
+        switch (statusCode) {
+            case HttpStatusCode.NotFound: text = "Page not found."; break;
+            // custom logic
+        }
+        return View("Error", 
+                    new ErrorViewModel { 
+                        RequestId = Activity.Current?.Id ?? HttpContext.TraceIdentifier, 
+                        ErrorText = text });
+    }
+}
+{% endhighlight %}
+
+As with other approaches built upon the Exception Handler middleware, the `Error` action sends an RFC 7807-compliant payload to the client by reusing the built-in logic, which is not something that we get when using the custom middleware approach, where we must explicitly use `ObjectResult` to get content negotiation.
+
+This finishes the overview of the commonly used approaches to create global exception handlers. Now we can follow up with a list of gotchas that we should have in mind when writing handlers, which are listed in no particular order.
+
+# Disable response caching
+For obvious reasons, response caching should be disabled when returning errors from exception handlers. This helper method clears cache headers:
+
+{% highlight csharp %}
+private static void ClearCacheHeaders(HttpResponse response)
+{
+    response.Headers[HeaderNames.CacheControl] = "no-cache";
+    response.Headers[HeaderNames.Pragma] = "no-cache";
+    response.Headers[HeaderNames.Expires] = "-1";
+    response.Headers.Remove(HeaderNames.ETag);
+}
+{% endhighlight %}
+
+and can be invoked for the context like so:
+
+{% highlight csharp %}
+ClearCacheHeaders(context.Response);
+{% endhighlight %}
+
+This method is [used by the default exception handling middleware](https://github.com/dotnet/aspnetcore/blob/6255c1ed960f5277d2e96ac2d0968c2c7e844ce2/src/Middleware/Diagnostics/src/ExceptionHandler/ExceptionHandlerMiddleware.cs#L153), and if you write your own middleware you should invoke it as well.
+
+# Reset the endpoint
+If the Endpoint Middleware had executed when the exception occurred, we need to reset the endpoint and route values to ensure things are recalculated before we reinvoke the middleware pipeline. The built-in exception handling middleware does it by [invoking a helper method](https://github.com/dotnet/aspnetcore/blob/6255c1ed960f5277d2e96ac2d0968c2c7e844ce2/src/Middleware/Diagnostics/src/ExceptionHandler/ExceptionHandlerMiddleware.cs#L142):
+
+{% highlight csharp %}
+private static void ClearHttpContext(HttpContext context)
+{
+    context.Response.Clear();
+    context.SetEndpoint(endpoint: null);
+    var routeValuesFeature = context.Features.Get<IRouteValuesFeature>();
+    routeValuesFeature?.RouteValues?.Clear();
+}
+{% endhighlight %}
+
+Of course, if we implement our own middleware we need to do this as well.
+
+# Abort if the response had already started
+If the response had already started sending when the exception occurred, you can't intercept it and modify the response, and need to abort the handler. The best thing you can do is simply log the situation, and rethrow the exception, like the built-in middleware does:
+
+{% highlight csharp %}
+if (context.Response.HasStarted)
+{
+    _logger.ResponseStartedErrorHandler();
+    throw exception;
+}
+{% endhighlight %}
+
+Another option is to simply do nothing, [like the Status Code Pages middleware does](https://github.com/dotnet/aspnetcore/blob/844a82e37cae48af2ab2ee4f39b41283e6bb4f0e/src/Middleware/Diagnostics/src/StatusCodePage/StatusCodePagesMiddleware.cs#L41).
+
+# Demystifying stack traces
+If you need to log or display the exception stack trace, make sure to clean it up first for human readership using the `Demystify` method in the [Ben.Demystifier](https://www.nuget.org/packages/Ben.Demystifier/) NuGet package. It's just a single method call that will get rid of a lot of junk. It is used like so:
+
+{% highlight csharp %}
+app.UseExceptionHandler(errorApp =>
+{
+    errorApp.Run(async context =>
+    {
+        var errorFeature = context.Features.Get<IExceptionHandlerFeature>();
+        var exception = errorFeature.Error;
+        var exception = exception.Demystify().ToString();
+        var stackTrace = EnhancedStackTrace.Current();
+        
+        // do other stuff
+    });
+});
+{% endhighlight %}
+
+# ProblemDetails
+For the fans of standards, beside the mandatory 4XX and 5XX status codes, textual responses in case of exceptions can be specified as conforming to the [RFC 7808: Problem Details for HTTP APIs](https://tools.ietf.org/html/rfc7807). It even has its own content type: `application/problem+json`. The type described in the RFC is in fact a part of the ASP.NET, and is called [ProblemDetails](https://github.com/dotnet/aspnetcore/blob/master/src/Mvc/Mvc.Core/src/ProblemDetails.cs), and is used by default for all the controllers annotated with the `[ApiController]` attribute. Other than the status code `Status`, the following textual fields can be filled:
+
+* `Title` - A short, localizable, human-readable summary of the problem type, that otherwise doesn't change.
+* `Type` - A URI reference [RFC 3986] that identifies the problem type
+* `Detail` - A human-readable explanation specific to this occurrence of the problem
+* `Instance` - A URI reference that identifies the specific occurrence of the problem. This would be some kind of a correlation/trace ID.
+
+For Web APIs, only the `Title` field (providing the error message) and `Detail` field are of use. We can return it like so:
+
+{% highlight csharp %}
+app.UseExceptionHandler(errorApp =>
+{
+    errorApp.Run(async context =>
+    {
+        var errorFeature = context.Features.Get<IExceptionHandlerFeature>();
+        var exception = errorFeature.Error;
+
+        context.Response.ContentType = "application/problem+json";
+        var traceId = Activity.Current?.Id ?? context?.TraceIdentifier;
+
+        var problemDetails = new ProblemDetails
+        {
+            Title = "An unexpected error occurred!",
+            Status = 500,
+            Detail = exception.Demystify().ToString(),
+            Instance = $"appName:error:{traceId}"
+        };
+
+        context.HttpContext.Response.StatusCode = problemDetails.Status.Value;
+        
+        var stream = httpContext.Response.Body;
+        await JsonSerializer.SerializeAsync(stream, problemDetails);
+    });
+});
+{% endhighlight %}
+
+# Verify the invoker
+Usually you don't want to share many exception details with the invoker, or do some other actions, unless it's a development environment. For production, a trimmed-down version of the exception message only containing basic information and a status code would suffice, whereas for the development environment you are likely to include stuff such as a stack trace, the exact filename and the line of code that caused the exception, and have real-time notifications activated at all times. This verification can be done is several ways:
+* By invoking the `IsDevelopment` extension method. For this you need to inject the `IWebHostEnvironment` service.
+* Verify the request (by URI, identity, or whatever) manually. This is best done by writing an extension method for the `HttpRequest`, which can then be invoked, e.g. `IsInvokerTrusted(context.Request)`.
+
+# Capture the trace/correlation ID
+You want to trace the exception along with the execution context of the request that caused it. To do that, make sure you you log/return the corresponding trace/exception ID. This could be your program-generated GUID, the thread-specific Activity ID or the trace ID:
+
+{% highlight csharp %}
+var traceId = Activity.Current?.Id ?? httpContext?.TraceIdentifier;
+{% endhighlight %}
+
+# Handle Kestrel's BadHttpRequestException
+If we use Kestrel as a reverse proxy or edge server, we must convert the `BadHttpRequestException` which Kestrel throws for low-server-level issues with the request, e.g. HTTP method not being allowed at server level, too large headers or too large payload body (which is configured by default as a policy at the server level for security reasons, to prevent e.g. too large files from being uploaded or large requests inducing a denial of service attack). These types of error should be converted from 500 to 413 status codes and treated as such, because they are not unhandled exceptions in our application. For that, we need to use reflection to get the underlying status code:
+
+{% highlight csharp %}
+app.UseExceptionHandler(errorApp =>
+{
+    errorApp.Run(async context =>
+    {
+        var errorFeature = context.Features.Get<IExceptionHandlerFeature>();
+        var exception = errorFeature.Error;
+ 
+        var isKestrelException = exception is BadHttpRequestException badHttpRequestException;
+        if(isKestrelException)
+        {
+            var message = badHttpRequestException.Message;
+            var status =  (int)typeof(BadHttpRequestException).GetProperty("StatusCode", 
+                BindingFlags.NonPublic | BindingFlags.Instance).GetValue(badHttpRequestException);
+            // write to the response using message and status
+        }
+        else {
+            // process other exception types
+        }
+    });
+});
+{% endhighlight %}
+
+# Organize your handler
+If want to cover all the edge cases, implement logging, notifications, integrations with external services (e.g. localized strings, caching, exception-triggered background jobs etc.), and want to make the code clean and testable, handle potentially hundreds of specific domain errors (with different policies attached), exception handlers can grow very large, up to few thousands lines of code. This makes it inconvenient to utilize the approaches that require us to provide a lambda, or a single function. In fact, writing such exception handlers in a single file alone would go against software engineering principles. There should thus be separate methods/classes for each specific functionality implemented, organized in different files.
+
+If the handler is to be reused among many projects, which is often the case, it is best to publish it in a shared NuGet package.
+
+# Only use async methods
+Using synchronous methods for the request I/O will throw an exception. The code will compile all right, but it will throw a runtime error. Suppose you want to read the body of the PUT/POST requests. This will not work:
+
+{% highlight csharp %}
+var requestType = context.Request.Method;
+var requestBody = "";
+var referrer = context.Request.Headers["Referer"].ToString();
+
+if ("POST" == requestType || "PUT" == requestType)
+{
+    using (var reader = new StreamReader(context.Request.Body))
+    {
+        requestBody = reader.ReadToEnd();
+    }
+}
+{% endhighlight %}
+
+Instead, you must do:
+
+{% highlight csharp %}
+if ("POST" == requestType || "PUT" == requestType)
+{
+    using (var reader = new StreamReader(context.Request.Body))
+    {
+        requestBody = await reader.ReadToEndAsync();
+    }
+}
+{% endhighlight %}
+
+# CORS
+We must set CORS inside the handler, otherwise our handler will return CORS errors to the client when middleware exceptions are thrown. Any origin would be fine in most cases:
+
+{% highlight csharp %}
+context.Response.Headers.Add("Access-Control-Allow-Origin", "*");
+{% endhighlight %}
+
+This can lead to crazy errors where some of your endpoints work just fine, and some don't, throwing CORS errors. [According to MS](https://github.com/aspnet/CORS/issues/46) this is "by design" in order to prevent leaking of exception details across origins.
+
+# Order
+Exception handler must  always be registered as the very first middleware, prior to authentication, HTTPS redirection, CORS or whatever, so that it catches any exceptions that occur in later calls. Unfortunately there is no way to check this either statically or dynamically, and you'll have to check this manually from time to time as your middleware pipeline evolves.
+
+# Sanitize your secrets
+Sometimes your endpoints can revel user secrets as a part of the URI or the payload, for example login credentials for the login API, or bearer token or API keys that are a part of the request headers, or user-sourced secrets such as credit card numbers, tokens for integration to other services and similar. This point could also cover the GDPR-protected data, which you don't want to randomly leak into logs and notification platforms. You must sanitize such data within the exception handler before logging them, by e.g. replacing them with asterisks. This sanitization logic can either be centralized in the handler, or exposed as a service provided by the app itself, that can be matched against an endpoint pattern.
+
+In case of bearer token/API keys the user authentication context should be decoded before sanitization, and provided as a part of the structured log, so that it can be easily looked up.
+
+# try-catch everything
+You don't want your centralized, global exception handling code to throw exceptions itself, so you must put everything even remotely suspicious of a behavior that could throw runtime exceptions into try-catch-finally blocks. That means everything dealing with JSON, string processing, potentially nullable properties etc. Finally blocks should be where you provide the default state for your variables, in case something breaks. Personally I just prefer assuming nothing will break, and use catch/finally blocks to alert the maintainer of the exception handler-related exception which requires urgent attention, and return immediately.
+
+# Unwrap inner exception
+In case of nested exceptions, you don't care about outer layers. You need to manually unwrap the exception like so:
+
+{% highlight csharp %}
+var excFeature = context.Features.Get<IExceptionHandlerPathFeature>();
+var ex = excFeature.Error;
+
+while (ex.Message.EndsWith("See the inner exception for details."))
+{
+    // should never really happen though!
+    if (ex.InnerException == null)
+    {
+        break;
+    }
+
+    ex = ex.InnerException;
+}
+{% endhighlight %}
+
+# Log debug information
+On a development environment you are likely to do non-release builds, which can provide a deeper insight into the exception, such as which exactly line of code caused it in which source code file. This is in most cases far more valuable information than e.g. full stack trace, which is usually useless without a complete execution history and a program state dump. Just seeing which line of code broke, for which API inputs, is usually enough to diagnose, and in many cases even fix the error immediately.
+
+We can get the debug info like so:
+
+{% highlight csharp %}
+// Get the first stack frame with a filename defined. Start from the zeroth stack frame which 
+// will land us to the innermost stack frame corresponding to the source code.
+string debugInfo = String.Empty;
+foreach (var frame in st.GetFrames())
+{
+    if (!string.IsNullOrEmpty(frame.GetFileName()))
+    {
+        // Get the file name
+        string fileName = frame.GetFileName();
+
+        // Get the method name
+        string methodName = frame.GetMethod().Name;
+
+        // Get the line number from the stack frame
+        int line = frame.GetFileLineNumber();
+        debugInfo = $"Filename: '{fileName}', method: '{methodName}', line: '{line}'.\n";
+        break;
+    }
+}
+{% endhighlight %}
