@@ -482,3 +482,32 @@ foreach (var frame in st.GetFrames())
     }
 }
 {% endhighlight %}
+
+# Help link mapping
+`Exception.HelpLink` property can be used to set a link to the help file associated with this exception. Its HTTP equivalent is the `Location` header. If the exception thrower sets the `HelpLink` property, the exception handler should map it to the  `Location` header that the UI client can use to show/open a help link when displaying error message details.
+
+{% highlight csharp %}
+Uri locationUri = null;
+if (!string.IsNullOrEmpty(ex.HelpLink))
+{
+    try
+    {
+        locationUri = new Uri(ex.HelpLink);
+    }
+    catch (Exception) { }
+}
+// ...
+if (null != locationUri)
+{
+    context.Response.Headers.Add("Location", locationUri.ToString());
+}
+{% endhighlight %}
+
+# Reason phrase
+In the HTTP response that is sent to a client, the three-digit status code is accompanied by a reason phrase (also known as status text) that summarizes the meaning of the code. Along with the HTTP version of the response, these items are placed in the first line of the response, which is therefore known as the status line. HTTP errors also have standardized response strings associated to their numeric codes which are generated automatically. In case of unhandled exception the status code 500 is used, and we would prefer that the exception type name becomes the reason phrase in lieu of the default message. This reason phrase is then viewable in the Debug console together with the status code.
+
+{% highlight csharp %}
+context.Response.HttpContext.Features.Get<IHttpResponseFeature>().ReasonPhrase = ex.GetType().Name;
+{% endhighlight %}
+
+Note that HTTP/2 doesn't have reason phrases.
